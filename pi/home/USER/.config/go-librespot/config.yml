@@ -1,0 +1,46 @@
+# go-librespot - Spotify Connect receiver for the Pi Zero W network speaker.
+# Installed to ~/.config/go-librespot/config.yml; started by the
+# spotify-connect.service user unit. No credentials are stored here: the
+# receiver advertises itself over mDNS (Spotify Connect) and the Spotify app
+# authenticates to it when a device picks "PiZERO Speakers".
+
+device_name: "@SPEAKER_NAME@"
+device_type: speaker
+
+# Audio goes through PipeWire via pipewire-alsa, so the USB speakers become the
+# output as soon as they are plugged in and every source mixes. The ALSA
+# backend is used instead of PulseAudio because go-librespot's PulseAudio
+# library has a hard 1 s per-request timeout, which fails track loads when the
+# single core is briefly busy.
+audio_backend: alsa
+audio_device: pipewire
+# Larger buffers on the single-core Pi keep Spotify playback free of xruns.
+audio_buffer_time: 500000
+audio_period_count: 4
+
+# The Zero has one slow core: 160 kbit/s is plenty for this speaker.
+bitrate: 160
+
+# Spotify's volume slider drives this stream's own PipeWire volume; the sink
+# volume (and the knob on the speakers) is left alone.
+volume_steps: 100
+initial_volume: 50
+external_volume: false
+
+# Built-in Spotify Connect discovery through the system avahi-daemon, which
+# already runs on the Pi. zeroconf_enabled keeps the device visible even after
+# someone has connected to it.
+zeroconf_enabled: true
+zeroconf_port: 0
+zeroconf_backend: avahi
+credentials:
+  type: zeroconf
+  zeroconf:
+    persist_credentials: false
+
+# No audio cache: it costs CPU/SD-card writes for no benefit on a speaker that
+# streams from Spotify anyway.
+cache:
+  enabled: false
+
+log_level: info

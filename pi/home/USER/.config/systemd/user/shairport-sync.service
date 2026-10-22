@@ -1,0 +1,19 @@
+[Unit]
+Description=AirPlay receiver (shairport-sync)
+Wants=pipewire-pulse.service
+After=pipewire-pulse.service
+PartOf=pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/shairport-sync --configfile=/etc/shairport-sync.conf
+Environment=PULSE_SERVER=unix:%t/pulse/native
+Restart=always
+RestartSteps=5
+RestartMaxDelaySec=60
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=default.target

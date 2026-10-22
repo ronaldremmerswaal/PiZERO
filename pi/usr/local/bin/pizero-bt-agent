@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""PiZERO Speakers Bluetooth pairing agent.
+
+Policy is read on every request, so it follows the persisted mode and the
+temporary pairing window without a restart:
+
+  open / pairing window : accept pairing, auto-trust paired devices
+  locked                : reject unpaired devices, disconnect untrusted ones
+
+Paired *and* trusted devices (the user's TV) may always reconnect and play.
+"""
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BLUEZ = "org.bluez"
+AGENT_PATH = "/org/pizero/btagent"
+MODE_FILE = "/etc/pizero/bluetooth-mode"
+WINDOW_FILE = "/run/pizero/bt-pair-until"
+
+bus = None
+
+
+def log(message):
+    print("pizero-bt-agent: " + message, flush=True)
+
+
+def persisted_mode():
+    try:
+        with open(MODE_FILE, encoding="utf-8") as handle:
+            mode = handle.read().strip()
+    except OSError:
+        return "locked"
+    return mode if mode in ("open", "locked") else "locked"
+
+
+def pair_window_active():
+    try:
+        with open(WINDOW_FILE, encoding="utf-8") as handle:
+            until = int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    return time.time() < until
+
+
+def permissive():
+    return persisted_mode() == "open" or pair_window_active()
+
+
+def device_props(path):
+    try:
+        obj = bus.get_object(BLUEZ, path)
+        return dbus.Interface(obj, dbus.PROPERTIES_IFACE).GetAll("org.bluez.Device1")
+    except dbus.DBusException:
+        return {}
+
+
+def is_known(path):
+    props = device_props(path)
+    return bool(props.get("Paired", False)) and bool(props.get("Trusted", False))
+
+
+class Agent(dbus.service.Object):
+    def __init__(self, connection, path):
+        super().__init__(connection, path)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Release(self):
+        log("agent released by bluetoothd")
+
+    def _check(self, path, what):
+        if is_known(path) or permissive():
+            return
+        log("rejecting %s for %s (locked)" % (what, path))
+        raise dbus.exceptions.DBusException(
+            "PiZERO Speakers is locked", name="org.bluez.Error.Rejected"
+        )
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        self._check(device, "PIN request")
+        return "0000"
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        self._check(device, "passkey request")
+        return dbus.UInt32(0)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        log("display passkey for %s" % device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        log("display PIN for %s" % device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        self._check(device, "pairing confirmation")
+        log("accepted pairing for %s" % device)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        self._check(device, "authorization")
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        self._check(device, "service authorization for %s" % uuid)
+
+    @dbus.service.method("org.bluez.Agent1", in_signature="", out_signature="")
+    def Cancel(self):
+        pass
+
+
+def register_agent():
+    try:
+        manager = dbus.Interface(
+            bus.get_object(BLUEZ, "/org/bluez"), "org.bluez.AgentManager1"
+        )
+        manager.RegisterAgent(dbus.ObjectPath(AGENT_PATH), "NoInputNoOutput")
+        manager.RequestDefaultAgent(dbus.ObjectPath(AGENT_PATH))
+        log("registered as default agent")
+    except dbus.DBusException as error:
+        log("agent registration failed: %s" % error)
+        return True  # retry
+    return False
+
+
+def set_prop(path, interface, name, value):
+    dbus.Interface(bus.get_object(BLUEZ, path), dbus.PROPERTIES_IFACE).Set(
+        interface, name, dbus.Boolean(value)
+    )
+
+
+def maintain():
+    """Enforce the adapter mode, trust paired devices, evict unknown ones."""
+    try:
+        objects = dbus.Interface(
+            bus.get_object(BLUEZ, "/"), "org.freedesktop.DBus.ObjectManager"
+        ).GetManagedObjects()
+    except dbus.DBusException:
+        return True
+
+    permissive_now = permissive()
+    for path, interfaces in objects.items():
+        adapter = interfaces.get("org.bluez.Adapter1")
+        if adapter is None:
+            continue
+        # bluetoothd resets Pairable/Discoverable when it starts, so the
+        # persisted mode is re-asserted here instead of only at boot.
+        for prop in ("Pairable", "Discoverable"):
+            if bool(adapter.get(prop, False)) != permissive_now:
+                try:
+                    set_prop(path, "org.bluez.Adapter1", prop, permissive_now)
+                    log("%s=%s" % (prop.lower(), "on" if permissive_now else "off"))
+                except dbus.DBusException as error:
+                    log("could not set %s: %s" % (prop, error))
+
+    for path, interfaces in objects.items():
+        props = interfaces.get("org.bluez.Device1")
+        if props is None:
+            continue
+        paired = bool(props.get("Paired", False))
+        trusted = bool(props.get("Trusted", False))
+        connected = bool(props.get("Connected", False))
+        address = str(props.get("Address", path))
+        if permissive_now and paired and not trusted:
+            try:
+                dbus.Interface(
+                    bus.get_object(BLUEZ, path), dbus.PROPERTIES_IFACE
+                ).Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+                log("trusted %s" % address)
+            except dbus.DBusException as error:
+                log("could not trust %s: %s" % (address, error))
+        elif not permissive_now and connected and not (paired and trusted):
+            try:
+                dbus.Interface(
+                    bus.get_object(BLUEZ, path), "org.bluez.Device1"
+                ).Disconnect()
+                log("disconnected unpaired/untrusted device %s" % address)
+            except dbus.DBusException as error:
+                log("could not disconnect %s: %s" % (address, error))
+    return True
+
+
+def on_name_owner_changed(name, old_owner, new_owner):
+    if name == BLUEZ and new_owner:
+        log("bluetoothd restarted, re-registering")
+        GLib.timeout_add_seconds(1, register_agent)
+
+
+def main():
+    global bus
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    Agent(bus, AGENT_PATH)
+    bus.add_signal_receiver(
+        on_name_owner_changed,
+        signal_name="NameOwnerChanged",
+        dbus_interface="org.freedesktop.DBus",
+        bus_name="org.freedesktop.DBus",
+    )
+    GLib.timeout_add(500, register_agent)
+    GLib.timeout_add_seconds(5, maintain)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

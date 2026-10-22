@@ -1,0 +1,31 @@
+#!/bin/bash
+# PiZERO Speakers: after every bluetoothd start, name the adapter and apply the
+# persisted Bluetooth mode (locked by default, see pizero-bluetooth-mode).
+set -u
+NAME=$(cat /etc/pizero/speaker-name 2>/dev/null || true)
+[ -n "$NAME" ] || NAME="PiZERO Speakers"
+
+/usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+
+for _ in $(seq 1 40); do
+    bluetoothctl show 2>/dev/null | grep -q '^Controller ' && break
+    sleep 0.5
+done
+
+for _ in $(seq 1 20); do
+    if bluetoothctl --timeout 10 power on 2>/dev/null | grep -q 'succeeded'; then
+        break
+    fi
+    /usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+    sleep 1
+done
+
+# The advertised friendly name; system-alias persists in the adapter settings.
+current_alias=$(bluetoothctl show 2>/dev/null |
+    sed -n 's/^[[:space:]]*Alias: //p' | head -1)
+if [ "$current_alias" != "$NAME" ]; then
+    bluetoothctl --timeout 10 system-alias "$NAME" >/dev/null 2>&1 || true
+fi
+
+/usr/local/bin/pizero-bluetooth-mode apply
+exit 0

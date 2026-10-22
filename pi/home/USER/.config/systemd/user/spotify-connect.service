@@ -1,0 +1,24 @@
+[Unit]
+Description=Spotify Connect receiver (go-librespot)
+Documentation=https://github.com/devgianlu/go-librespot
+# Audio goes through pipewire-pulse so it mixes with the other receivers and
+# follows the default sink (the USB speakers when they are plugged in).
+Wants=pipewire-pulse.service
+After=pipewire-pulse.service
+PartOf=pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/spotify-connect --config_dir %h/.config/go-librespot
+Environment=PULSE_SERVER=unix:%t/pulse/native
+Restart=always
+RestartSteps=5
+RestartMaxDelaySec=60
+RestartSec=5
+# Some nice level so a single-core Pi stays responsive while decoding audio.
+Nice=5
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

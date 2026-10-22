@@ -1,0 +1,20 @@
+#!/bin/bash
+# PiZERO Speakers: close the pairing window when its deadline is reached.
+# Started as a transient systemd service by pizero-bt-pair, so it keeps
+# running if the SSH session goes away. Polls the deadline instead of sleeping
+# once, which stays correct if the (RTC-less) clock is stepped by NTP.
+set -u
+
+WINDOW_FILE=/run/pizero/bt-pair-until
+
+while :; do
+    until=$(cat "$WINDOW_FILE" 2>/dev/null || echo 0)
+    case "$until" in '' | *[!0-9]*) until=0 ;; esac
+    now=$(date +%s)
+    [ "$until" -le "$now" ] && break
+    remaining=$((until - now))
+    [ "$remaining" -gt 5 ] && remaining=5
+    sleep "$remaining"
+done
+
+/usr/local/bin/pizero-bluetooth-mode apply

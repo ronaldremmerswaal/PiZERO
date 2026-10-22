@@ -1,0 +1,20 @@
+#!/bin/sh
+# PiZERO Speakers: when Wi-Fi comes back, restart Spotify Connect so it does
+# not keep a stale access-point/dealer connection from before the outage.
+IFACE=$1
+ACTION=$2
+
+# Only wireless interfaces; dispatcher runs as root with a minimal PATH.
+[ -n "$IFACE" ] && [ -e "/sys/class/net/$IFACE/wireless" ] || exit 0
+
+case "$ACTION" in
+    up)
+        /usr/local/bin/pizero-audio-reconnect
+        ;;
+    connectivity-change)
+        case "${CONNECTIVITY_STATE:-}" in
+            full | portal) /usr/local/bin/pizero-audio-reconnect ;;
+        esac
+        ;;
+esac
+exit 0

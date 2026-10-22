@@ -1,0 +1,78 @@
+#!/bin/bash
+# PiZERO Speakers: apply the persisted Bluetooth mode to the adapter.
+#
+#   locked  adapter powered, not discoverable, not pairable
+#   open    discoverable + pairable (pairing window behaves like open)
+#
+# The pairing window marker (/run/pizero/bt-pair-until) temporarily overrides
+# the persisted mode; it disappears on reboot because /run is a tmpfs.
+set -u
+
+MODE_FILE=/etc/pizero/bluetooth-mode
+WINDOW_FILE=/run/pizero/bt-pair-until
+
+mode=locked
+if [ -r "$MODE_FILE" ]; then
+    case "$(tr -d '[:space:]' <"$MODE_FILE")" in
+        open | locked) mode=$(tr -d '[:space:]' <"$MODE_FILE") ;;
+    esac
+fi
+
+window=0
+window_just_closed=0
+if [ -r "$WINDOW_FILE" ]; then
+    until=$(cat "$WINDOW_FILE" 2>/dev/null || echo 0)
+    case "$until" in '' | *[!0-9]*) until=0 ;; esac
+    if [ "$until" -gt "$(date +%s)" ]; then
+        window=1
+    else
+        window_just_closed=1
+        rm -f "$WINDOW_FILE"
+    fi
+fi
+
+# Wait for the adapter to show up (bluetoothd may still be starting).
+for _ in $(seq 1 30); do
+    bluetoothctl show 2>/dev/null | grep -q '^Controller ' && break
+    sleep 0.5
+done
+
+/usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+bluetoothctl --timeout 10 power on >/dev/null 2>&1 || true
+
+# A device can finish pairing in the last seconds of the window. Trust devices
+# that paired during it before the adapter locks again.
+if [ "$window_just_closed" = 1 ]; then
+    for mac in $(bluetoothctl devices Paired 2>/dev/null | awk '{print $2}'); do
+        bluetoothctl --timeout 5 trust "$mac" >/dev/null 2>&1 || true
+    done
+fi
+
+apply_flag() {
+    # $1 = Discoverable|Pairable, $2 = on|off (bluetoothctl reports yes/no)
+    local want=no current=""
+    [ "$2" = on ] && want=yes
+    for _ in $(seq 1 5); do
+        bluetoothctl --timeout 3 "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" "$2" >/dev/null 2>&1 || true
+        current=$(bluetoothctl show 2>/dev/null | sed -n "s/^[[:space:]]*$1: //p" | head -1)
+        [ "$current" = "$want" ] && return 0
+        sleep 1
+    done
+    echo "warning: could not set $1=$2 (currently ${current:-unknown})" >&2
+    return 1
+}
+
+if [ "$mode" = open ] || [ "$window" = 1 ]; then
+    apply_flag Pairable on || true
+    apply_flag Discoverable on || true
+    if [ "$window" = 1 ]; then
+        echo "bluetooth mode: $mode (pairing window active)"
+    else
+        echo "bluetooth mode: $mode"
+    fi
+else
+    apply_flag Discoverable off || true
+    apply_flag Pairable off || true
+    echo "bluetooth mode: locked"
+fi
+exit 0

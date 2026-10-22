@@ -1,0 +1,90 @@
+#!/bin/bash
+# PiZERO Speakers network watchdog. Run every minute by a systemd timer.
+#
+# Nothing about the LAN is hardcoded: the default gateway and the active Wi-Fi
+# profile are discovered at runtime. Escalation:
+#   down > 2 min   bounce Wi-Fi and re-activate the profile
+#   down > 10 min  restart NetworkManager (and reload brcmfmac if wlan is gone)
+#   down > 20 min  reboot, but only after the Pi has been up for 30 min
+set -u
+
+STATE_DIR=/run/pizero
+STATE=$STATE_DIR/net-down-since
+REBOOT_STAMP=/var/lib/pizero/last-watchdog-reboot
+mkdir -p "$STATE_DIR"
+
+log() { logger -t pizero-net-watchdog "$*"; }
+
+gateway=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
+if [ -n "$gateway" ] && ping -c3 -W2 -n "$gateway" >/dev/null 2>&1; then
+    if [ -r "$STATE" ]; then
+        since=$(cat "$STATE" 2>/dev/null || echo 0)
+        down=$(( $(date +%s) - since ))
+        if [ "$down" -ge 120 ]; then
+            log "connectivity restored after ${down}s, restarting audio clients"
+            /usr/local/bin/pizero-audio-reconnect
+        else
+            log "connectivity restored after ${down}s, no restart needed"
+        fi
+    fi
+    rm -f "$STATE" "$STATE_DIR/net-acted-"*
+    exit 0
+fi
+
+now=$(date +%s)
+if [ ! -r "$STATE" ]; then
+    echo "$now" >"$STATE"
+    log "gateway ${gateway:-missing} unreachable, outage timer started"
+    exit 0
+fi
+since=$(cat "$STATE" 2>/dev/null || echo "$now")
+case "$since" in '' | *[!0-9]*) since=$now; echo "$since" >"$STATE" ;; esac
+down=$((now - since))
+
+wifi=$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null |
+    awk -F: '$2 == "802-11-wireless" {print $1; exit}')
+if [ -z "$wifi" ]; then
+    wifi=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null |
+        awk -F: '$2 == "802-11-wireless" {print $1; exit}')
+fi
+
+acted() { [ -f "$STATE_DIR/net-acted-$1" ]; }
+mark() { : >"$STATE_DIR/net-acted-$1"; }
+
+if [ "$down" -ge 120 ] && ! acted wifi; then
+    mark wifi
+    log "down ${down}s: bouncing Wi-Fi (${wifi:-no profile})"
+    nmcli radio wifi off
+    sleep 3
+    nmcli radio wifi on
+    [ -n "$wifi" ] && nmcli connection up "$wifi" >/dev/null 2>&1
+elif [ "$down" -ge 600 ] && ! acted netmanager; then
+    mark netmanager
+    log "down ${down}s: restarting NetworkManager"
+    systemctl restart NetworkManager
+    sleep 5
+    if ! nmcli -t -f DEVICE,STATE device 2>/dev/null | grep -q '^wlan0:connected'; then
+        log "wlan0 not connected after NetworkManager restart, reloading brcmfmac"
+        modprobe -r brcmfmac 2>/dev/null || true
+        modprobe brcmfmac 2>/dev/null || true
+        sleep 5
+    fi
+    [ -n "$wifi" ] && nmcli connection up "$wifi" >/dev/null 2>&1
+elif [ "$down" -ge 1200 ] && ! acted reboot; then
+    uptime_s=$(cut -d. -f1 /proc/uptime)
+    last_reboot=0
+    [ -r "$REBOOT_STAMP" ] && last_reboot=$(cat "$REBOOT_STAMP" 2>/dev/null || echo 0)
+    case "$last_reboot" in '' | *[!0-9]*) last_reboot=0 ;; esac
+    now_s=$(date +%s)
+    if [ "$uptime_s" -lt 1800 ]; then
+        log "down ${down}s but uptime only ${uptime_s}s: waiting before reboot"
+    elif [ $((now_s - last_reboot)) -lt 7200 ]; then
+        log "down ${down}s but a watchdog reboot happened $((now_s - last_reboot))s ago: not rebooting"
+    else
+        mark reboot
+        mkdir -p "$(dirname "$REBOOT_STAMP")" 2>/dev/null || true
+        echo "$now_s" >"$REBOOT_STAMP" 2>/dev/null || true
+        log "down ${down}s, uptime ${uptime_s}s: rebooting"
+        systemctl reboot
+    fi
+fi

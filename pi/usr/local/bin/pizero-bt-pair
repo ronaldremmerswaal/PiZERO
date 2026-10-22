@@ -1,0 +1,28 @@
+#!/bin/bash
+# PiZERO Speakers: open a temporary pairing window.
+# The timeout runs on the Pi (transient systemd timer), so it survives an SSH
+# disconnect; when it ends the persisted (locked) mode is applied again.
+set -eu
+
+secs=${1:-120}
+case "$secs" in
+    '' | *[!0-9]*) echo "usage: pizero-bt-pair [seconds]" >&2; exit 2 ;;
+esac
+if [ "$secs" -lt 5 ]; then
+    echo "pairing window must be at least 5 seconds" >&2
+    exit 2
+fi
+
+mkdir -p /run/pizero
+echo $(( $(date +%s) + secs )) >/run/pizero/bt-pair-until
+
+systemctl stop pizero-bt-pair-timeout.service pizero-bt-pair-timeout.timer 2>/dev/null || true
+systemctl reset-failed pizero-bt-pair-timeout.service 2>/dev/null || true
+
+/usr/local/bin/pizero-bluetooth-mode apply
+# A transient service (not a timer) closes the window on the Pi; it keeps
+# running when the SSH session ends.
+systemd-run --quiet --collect --unit=pizero-bt-pair-timeout \
+    /usr/local/bin/pizero-bt-pair-close
+
+echo "pairing window: ${secs}s (then back to $(tr -d '[:space:]' </etc/pizero/bluetooth-mode 2>/dev/null || echo locked) mode)"

@@ -1,0 +1,14 @@
+[Unit]
+Description=Power the Bluetooth adapter and apply the lock mode
+After=bluetooth.service
+Requires=bluetooth.service
+PartOf=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+TimeoutStartSec=180
+ExecStart=/usr/local/bin/pizero-bluetooth-radio
+
+[Install]
+WantedBy=multi-user.target

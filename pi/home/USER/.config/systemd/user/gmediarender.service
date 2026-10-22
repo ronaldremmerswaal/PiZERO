@@ -1,0 +1,19 @@
+[Unit]
+Description=UPnP/DLNA audio renderer (gmediarender)
+Wants=pipewire-pulse.service
+After=pipewire-pulse.service
+PartOf=pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/gmediarender -f "@SPEAKER_NAME@" -u @GMEDIA_UUID@ --gstout-audiosink=pulsesink --gstout-initial-volume-db=-10 --mime-filter audio
+Environment=PULSE_SERVER=unix:%t/pulse/native
+Restart=always
+RestartSteps=5
+RestartMaxDelaySec=60
+RestartSec=3
+Nice=5
+
+[Install]
+WantedBy=default.target

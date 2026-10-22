@@ -1,0 +1,14 @@
+#!/bin/bash
+# PiZERO Speakers: restart network-sensitive audio clients after connectivity
+# returns (go-librespot keeps stale Spotify AP/dealer connections).
+set -u
+
+for dir in /run/user/*/pulse; do
+    [ -S "$dir/native" ] || continue
+    uid=${dir#/run/user/}
+    uid=${uid%/pulse}
+    user=$(id -un "$uid" 2>/dev/null) || continue
+    /usr/sbin/runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        systemctl --user try-restart spotify-connect.service >/dev/null 2>&1 || true
+    /usr/bin/logger -t pizero-audio-reconnect "restarted spotify-connect for $user (uid $uid)"
+done

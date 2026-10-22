@@ -1,0 +1,9 @@
+[Unit]
+Description=PiZERO network watchdog (ping gateway, recover Wi-Fi)
+After=NetworkManager.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+TimeoutStartSec=300
+ExecStart=/usr/local/bin/pizero-net-watchdog
