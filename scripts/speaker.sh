@@ -405,6 +405,9 @@ enable_units() {
 
 reload_units() {
     remote_root "systemctl daemon-reload"
+    # LimitNICE (user@.service.d) only applies to a newly started user manager;
+    # raise it on the running one too, or wireplumber's Nice=-11 fails to start.
+    remote_root "prlimit --pid \$(systemctl show user@$(remote 'id -u' | tr -d '\r').service -p MainPID --value) --nice=31:31"
     remote "systemctl --user daemon-reload"
 }
 
