@@ -83,6 +83,7 @@ ssh-copy-id <user>@raspberrypi.local  # only if you did not add your key in the 
 | `PI_USER` | ssh's default | SSH user on the Pi (the one created in the Imager) |
 | `SPEAKER_NAME` | `PiZERO Speakers` | Name shown in AirPlay, Spotify, DLNA and Bluetooth |
 | `BT_MODE_DEFAULT` | `locked` | Bluetooth mode on first install: `locked` or `open` |
+| `SPEAKER_MODE_DEFAULT` | `all` | Speaker mode on first install: `all`, `bluetooth` or `network` (see [Speaker modes](#speaker-modes-bluetooth-only-network-only-both)) |
 
 The SSH user needs passwordless `sudo` (the Imager's default user has it).
 
@@ -102,7 +103,8 @@ it only changes what differs. It:
   checksum-verified release by `scripts/build-spotify-connect.sh`; ARMv6 build for 32-bit OS,
   arm64 build for 64-bit OS)
 - deploys the configuration in `pi/` (the speaker name is filled in from `config.env`)
-- applies the recovery settings below and starts everything
+- applies the recovery settings below, applies the persisted speaker mode and starts the
+  services that mode allows
 
 Check the result:
 
@@ -177,6 +179,38 @@ protects against devices impersonating it): run `bt-forget` for it, then `bt-pai
 Some TVs keep playing through their own speakers after pairing; select the Bluetooth speaker as
 the TV's sound output in its sound settings.
 
+### Speaker modes: Bluetooth only, network only, both
+All four protocols run by default. On a Zero W the single CPU core and the shared
+Wi-Fi/Bluetooth radio are the scarce resources: a connected Bluetooth device alone costs ~25 % CPU,
+and Wi-Fi and Bluetooth time-share the same antenna. If you only ever use one kind of source, the
+speaker mode turns the other side off:
+
+| Mode | Network receivers | Bluetooth | Frees |
+|---|---|---|---|
+| `all` (default) | AirPlay, DLNA, Spotify | on | — |
+| `bluetooth` | off (disabled and stopped) | on | the receiver processes and their CPU time; no audio traffic crosses Wi-Fi, so Bluetooth does not compete for the shared radio |
+| `network` | on | off (disabled, stopped, radio soft-blocked) | the Bluetooth stack and the ~25 % CPU a connected device costs |
+
+```sh
+scripts/speaker.sh mode                # print the current mode
+scripts/speaker.sh mode bluetooth
+scripts/speaker.sh mode network
+scripts/speaker.sh mode all
+```
+
+Wi-Fi stays on in `bluetooth` mode: it is how you reach the Pi (SSH, `status`, updates) and the
+watchdog that recovers the Pi depends on it. With the receivers stopped no audio crosses Wi-Fi, so
+Bluetooth no longer competes with AirPlay/DLNA streaming on the shared radio; only the idle Wi-Fi
+connection remains. In `network` mode the adapter is soft-blocked with `rfkill`, so nothing can
+power it by accident.
+
+The mode is stored in `/etc/pizero/mode` on the Pi and survives reboots and
+`setup`/`update`/`reinstall` (like `/etc/pizero/bluetooth-mode`, it is only written when absent; a
+fresh install starts with `SPEAKER_MODE_DEFAULT`). Unit enablement makes it persistent, and a small
+one-shot unit re-applies the radio state before `bluetoothd` starts. Switching interrupts whatever
+is playing; switching back enables and starts the receivers again. The `bt-*` commands refuse to
+run in `network` mode because there is no Bluetooth stack.
+
 ### Low latency: analog input
 Network audio always has some delay. Many powered speakers (e.g. Audioengine A2+) have an analog
 input that is mixed with USB: connect the PC's line-out to it and switch between the analog output
@@ -186,8 +220,9 @@ input that is mixed with USB: connect the PC's line-out to it and switch between
 
 | Command | What it does |
 |---|---|
-| `scripts/speaker.sh status` | Services, Bluetooth mode/devices, output device, network, load, memory |
+| `scripts/speaker.sh status` | Speaker mode, services, Bluetooth mode/devices, output device, network, load, memory |
 | `scripts/speaker.sh restart` | Restart the speaker services |
+| `scripts/speaker.sh mode [M]` | Speaker mode: `all` (default), `bluetooth` or `network`; no argument prints it |
 | `scripts/speaker.sh logs [service]` | Recent logs (e.g. `shairport-sync`, `spotify-connect`, `gmediarender`) |
 | `scripts/speaker.sh update` | `apt full-upgrade`, refresh Spotify binary, redeploy config, restart |
 | `scripts/speaker.sh reinstall` | Reinstall all speaker packages + Spotify binary, redeploy, restart |
@@ -207,13 +242,14 @@ version and checksums there, then run `scripts/speaker.sh update`.
 | System hang | Hardware watchdog reboots after 15 s |
 | Kernel crash | Automatic reboot after 10 s |
 | Power cut | Logs are kept in RAM, automatic apt timers are off, the file system is repaired at boot (`fsck.repair=yes`); everything starts without a login |
+| Reboot or power cut in `bluetooth`/`network` mode | The mode is applied again at boot (`pizero-mode.service`, ordered before `bluetoothd`): services that the mode disables stay off and the Bluetooth radio stays soft-blocked in `network` mode |
 | USB speakers unplugged/replugged | The output comes back as default automatically |
 
 **Protect mode** (`scripts/speaker.sh protect on`) makes the root file system read-only
 (Raspberry Pi OS overlay): power cuts cannot damage it, but all changes are lost at reboot.
 Recommended once everything is set up (and your Bluetooth devices are paired).
-`setup`, `update`, `reinstall` and the `bt-*` commands refuse to run while it is on; run
-`protect off` first.
+`setup`, `update`, `reinstall`, `mode` (when setting one) and the `bt-*` commands refuse to run
+while it is on; run `protect off` first.
 
 ## 8. Troubleshooting
 
@@ -242,5 +278,6 @@ scripts/linux-pc.sh              make AirPlay speakers outputs on a Linux PC (Pi
 scripts/set-wifi.py              fix Wi-Fi settings on a Pi SD card from a PC
 config.example.env               settings template (copy to config.env)
 pi/                              files deployed to the Pi, mirroring their paths
-                                 (pi/home/USER = the SSH user's home; @SPEAKER_NAME@ etc. are filled in)
+                                 (pi/home/USER = the SSH user's home; @SPEAKER_NAME@ etc. are filled in;
+                                 pi/etc/pizero/mode and bluetooth-mode are only installed when absent)
 ```

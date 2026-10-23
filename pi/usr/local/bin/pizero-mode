@@ -1,0 +1,155 @@
+#!/bin/bash
+# PiZERO Speakers: the persisted speaker mode.
+#
+#   all        AirPlay, DLNA, Spotify Connect and Bluetooth (default)
+#   bluetooth  Bluetooth only: the network receivers are disabled and stopped,
+#              which frees their CPU time and leaves the shared Wi-Fi/Bluetooth
+#              radio to Bluetooth. Wi-Fi stays on for SSH and the watchdog.
+#   network    Network receivers only: the Bluetooth stack is disabled and
+#              stopped and the adapter is soft-blocked (rfkill).
+#
+# The mode lives in /etc/pizero/mode. Unit enablement makes it survive reboots;
+# pizero-mode boot re-asserts the rfkill state before bluetoothd starts.
+#
+# Usage: pizero-mode                       print the persisted mode
+#        pizero-mode all|bluetooth|network persist and apply
+#        pizero-mode apply                 apply the persisted mode
+#        pizero-mode boot                  boot-time part (rfkill only)
+set -u
+
+MODE_FILE=/etc/pizero/mode
+MODE_DEFAULT=all
+APP_UNITS=(shairport-sync.service gmediarender.service spotify-connect.service)
+# Dependents first: stopping bluetooth.service also stops them (PartOf=).
+BT_UNITS=(pizero-bt-agent.service pizero-bluetooth-radio.service bluetooth.service)
+
+log() { printf 'pizero-mode: %s\n' "$*"; }
+
+read_mode() {
+    local stored=
+    [ -r "$MODE_FILE" ] && stored=$(tr -d '[:space:]' <"$MODE_FILE" 2>/dev/null || true)
+    case "$stored" in
+        all | bluetooth | network) printf '%s' "$stored" ;;
+        *) printf '%s' "$MODE_DEFAULT" ;;
+    esac
+}
+
+# The audio session runs without a login (linger, enabled by speaker.sh
+# setup), so its user manager is the only one that can enable and start the
+# receiver units. Resolve the name and uid at runtime; never hardcode them.
+linger_users() {
+    local path
+    for path in /var/lib/systemd/linger/*; do
+        [ -f "$path" ] || continue
+        printf '%s\n' "${path##*/}"
+    done
+}
+
+# systemctl --user for every lingering user with a running user manager.
+user_ctl() {
+    local action=$1 found=0 name uid path
+    shift
+    while read -r name; do
+        [ -n "$name" ] || continue
+        found=1
+        uid=$(id -u "$name" 2>/dev/null) || continue
+        [ -d "/run/user/$uid/systemd" ] ||
+            { log "warning: the user manager for $name is not running"; continue; }
+        runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user "$action" "$@" >/dev/null 2>&1 ||
+            log "warning: systemctl --user $action $* failed for $name"
+    done <<EOF
+$(linger_users)
+EOF
+    # No linger file (e.g. a distribution default): fall back to any running
+    # user manager, so a manual 'speaker.sh mode' still toggles the units.
+    if [ "$found" = 0 ]; then
+        for path in /run/user/[0-9]*; do
+            [ -d "$path/systemd" ] || continue
+            uid=${path##*/}
+            name=$(id -un "$uid" 2>/dev/null) || continue
+            found=1
+            runuser -u "$name" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+                systemctl --user "$action" "$@" >/dev/null 2>&1 ||
+                log "warning: systemctl --user $action $* failed for $name"
+        done
+    fi
+    [ "$found" = 1 ]
+}
+
+apply_mode() {
+    case "$mode" in
+        network)
+            systemctl disable --now "${BT_UNITS[@]}" >/dev/null 2>&1 || true
+            # The soft block keeps the adapter off even if something starts
+            # bluetoothd by hand (a manual 'speaker.sh restart' cannot).
+            /usr/sbin/rfkill block bluetooth 2>/dev/null || true
+            user_ctl enable --now "${APP_UNITS[@]}" ||
+                log "warning: no user session to enable the receivers"
+            log "network mode: Bluetooth disabled, network receivers enabled"
+            ;;
+        bluetooth)
+            /usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+            systemctl enable --now "${BT_UNITS[@]}" >/dev/null 2>&1 || true
+            user_ctl disable --now "${APP_UNITS[@]}" ||
+                log "warning: no user session to stop the receivers"
+            log "bluetooth mode: Bluetooth enabled, network receivers off"
+            ;;
+        all)
+            /usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+            systemctl enable --now "${BT_UNITS[@]}" >/dev/null 2>&1 || true
+            user_ctl enable --now "${APP_UNITS[@]}" ||
+                log "warning: no user session to enable the receivers"
+            log "all mode: Bluetooth and network receivers enabled"
+            ;;
+    esac
+}
+
+mode=$(read_mode)
+
+if [ $# -eq 0 ]; then
+    printf '%s\n' "$mode"
+    exit 0
+fi
+
+case "$1" in
+    apply | boot) ;;
+    all | bluetooth | network) mode=$1 ;;
+    *)
+        echo "usage: pizero-mode [all|bluetooth|network|apply|boot]" >&2
+        exit 2
+        ;;
+esac
+
+# Boot: only the rfkill state needs re-asserting (the boot unit orders this
+# before bluetoothd). It must not start units: that would contradict the
+# unit's ordering and can deadlock the boot transaction.
+if [ "$1" = boot ]; then
+    if [ "$mode" = network ]; then
+        # The rfkill entry appears with the HCI device; on some kernels that
+        # happens later than local-fs. Wait briefly so the block cannot be a
+        # silent no-op (bounded: never hold up boot for long if it is absent).
+        for _ in $(seq 1 30); do
+            /usr/sbin/rfkill list bluetooth 2>/dev/null | grep -q . && break
+            sleep 0.5
+        done
+        /usr/sbin/rfkill block bluetooth 2>/dev/null || true
+    else
+        /usr/sbin/rfkill unblock bluetooth 2>/dev/null || true
+    fi
+    log "boot: $mode mode applied to the radio"
+    exit 0
+fi
+
+# Persist before applying: if a unit fails, the next apply converges there.
+if [ "$1" != apply ]; then
+    install -d -m 0755 -o root -g root /etc/pizero 2>/dev/null || true
+    if ! printf '%s\n' "$mode" >"$MODE_FILE"; then
+        echo "pizero-mode: cannot write $MODE_FILE" >&2
+        exit 1
+    fi
+    chmod 0644 "$MODE_FILE"
+fi
+
+apply_mode
+exit 0

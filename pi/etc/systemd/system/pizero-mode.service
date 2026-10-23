@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply the persisted PiZERO speaker mode to the radio
+# Unit enablement already selects the services at boot; only the rfkill state
+# is not persistent in the unit files. Order it before bluetoothd so the
+# adapter never comes up in a mode that disables Bluetooth.
+After=local-fs.target
+Before=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+ExecStart=/usr/local/bin/pizero-mode boot
+
+[Install]
+WantedBy=multi-user.target

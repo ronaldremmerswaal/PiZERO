@@ -18,6 +18,7 @@ _env_PI_HOST=${PI_HOST-}
 _env_PI_USER=${PI_USER-}
 _env_SPEAKER_NAME=${SPEAKER_NAME-}
 _env_BT_MODE_DEFAULT=${BT_MODE_DEFAULT-}
+_env_SPEAKER_MODE_DEFAULT=${SPEAKER_MODE_DEFAULT-}
 if [[ -f $CONFIG_FILE ]]; then
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
@@ -28,6 +29,7 @@ PI_HOST=${_env_PI_HOST:-${PI_HOST:-raspberrypi.local}}
 PI_USER=${_env_PI_USER:-${PI_USER:-}}
 SPEAKER_NAME=${_env_SPEAKER_NAME:-${SPEAKER_NAME:-PiZERO Speakers}}
 BT_MODE_DEFAULT=${_env_BT_MODE_DEFAULT:-${BT_MODE_DEFAULT:-locked}}
+SPEAKER_MODE_DEFAULT=${_env_SPEAKER_MODE_DEFAULT:-${SPEAKER_MODE_DEFAULT:-all}}
 
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -38,6 +40,10 @@ note() { printf '    %s\n' "$*"; }
 case $BT_MODE_DEFAULT in
     open | locked) ;;
     *) die "BT_MODE_DEFAULT must be 'open' or 'locked'" ;;
+esac
+case $SPEAKER_MODE_DEFAULT in
+    all | bluetooth | network) ;;
+    *) die "SPEAKER_MODE_DEFAULT must be 'all', 'bluetooth' or 'network'" ;;
 esac
 
 # Runtime packages. Every entry is used by one of the speaker services.
@@ -79,9 +85,11 @@ Commands:
                restart
   reinstall    Reinstall all speaker packages and the Spotify binary, redeploy,
                restart
-  status       Services, Bluetooth mode/devices, sink, network, load, RAM
+  status       Speaker mode, services, Bluetooth mode/devices, sink, network, load, RAM
   restart      Restart the speaker services (no package/config work)
   logs [S]     Recent journal for service S (default: all speaker services)
+  mode [M]     Speaker mode: "all" (default), "bluetooth" or "network";
+               without M prints the persisted mode
   bt-pair [S]  Open a pairing window for S seconds (default 120); the timeout
                runs on the Pi, then the persisted mode returns
   bt-mode M    Persist and apply Bluetooth mode: "locked" (default) or "open"
@@ -95,6 +103,7 @@ Configuration:
     PI_USER          SSH user (default: ssh's own default / ~/.ssh/config)
     SPEAKER_NAME     advertised name (default "PiZERO Speakers")
     BT_MODE_DEFAULT  "locked" (default) or "open"
+    SPEAKER_MODE_DEFAULT  "all" (default), "bluetooth" or "network"
 
 Examples:
   $(basename "$0") setup
@@ -194,6 +203,23 @@ require_writable() {
         die "root filesystem is overlay-protected; run '$(basename "$0") protect off' first"
 }
 
+# Speaker mode persisted on the Pi: all, bluetooth or network.
+speaker_mode() {
+    local mode
+    mode=$(remote 'cat /etc/pizero/mode 2>/dev/null || echo all' | tr -d '\r')
+    case $mode in
+        all | bluetooth | network) printf '%s' "$mode" ;;
+        *) printf 'all' ;;
+    esac
+}
+
+require_bluetooth_mode() {
+    local mode
+    mode=$(speaker_mode)
+    [[ $mode != network ]] ||
+        die "Bluetooth is off in network mode; run '$(basename "$0") mode bluetooth' (or 'mode all') first"
+}
+
 # --- staging and deployment -------------------------------------------------
 
 stage_tree() {
@@ -202,11 +228,11 @@ stage_tree() {
     STAGE=$(mktemp -d)
     trap 'rm -rf "$STAGE"' EXIT
     cp -a "$REPO_DIR/pi/." "$STAGE/"
-    python3 - "$STAGE" "$SPEAKER_NAME" "$BT_MODE_DEFAULT" "$GMEDIA_UUID" <<'PY'
+    python3 - "$STAGE" "$SPEAKER_NAME" "$BT_MODE_DEFAULT" "$SPEAKER_MODE_DEFAULT" "$GMEDIA_UUID" <<'PY'
 import os
 import sys
 
-root, name, bt_mode, gmedia_uuid = sys.argv[1:5]
+root, name, bt_mode, speaker_mode, gmedia_uuid = sys.argv[1:6]
 plain = name.replace("\\", "\\\\").replace('"', '\\"')
 # systemd also expands % specifiers and $ variables in unit files.
 systemd = plain.replace("%", "%%").replace("$", "$$")
@@ -215,7 +241,12 @@ for dirpath, _dirnames, filenames in os.walk(root):
         path = os.path.join(dirpath, filename)
         with open(path, "rb") as handle:
             data = handle.read()
-        markers = (b"@SPEAKER_NAME", b"@BT_MODE_DEFAULT", b"@GMEDIA_UUID")
+        markers = (
+            b"@SPEAKER_NAME",
+            b"@BT_MODE_DEFAULT",
+            b"@SPEAKER_MODE_DEFAULT",
+            b"@GMEDIA_UUID",
+        )
         if not any(marker in data for marker in markers):
             continue
         quoted = systemd if filename.endswith((".service", ".timer", ".socket")) else plain
@@ -223,6 +254,7 @@ for dirpath, _dirnames, filenames in os.walk(root):
         text = text.replace("@SPEAKER_NAME_RAW@", name)
         text = text.replace("@SPEAKER_NAME@", quoted)
         text = text.replace("@BT_MODE_DEFAULT@", bt_mode)
+        text = text.replace("@SPEAKER_MODE_DEFAULT@", speaker_mode)
         text = text.replace("@GMEDIA_UUID@", gmedia_uuid)
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(text)
@@ -244,33 +276,42 @@ deploy_files() {
     [[ -n $GMEDIA_UUID ]] || GMEDIA_UUID=$(gmediarender_uuid)
     stage_tree
 
-    # Root-owned system files. etc/pizero/bluetooth-mode is user state and is
-    # deployed only when absent (deploy_bt_mode).
-    tar -C "$STAGE" -cf - --exclude=etc/pizero/bluetooth-mode etc usr |
+    # Root-owned system files. etc/pizero/bluetooth-mode and etc/pizero/mode
+    # are machine state and are deployed only when absent (deploy_state_files).
+    tar -C "$STAGE" -cf - --exclude=etc/pizero/bluetooth-mode --exclude=etc/pizero/mode etc usr |
         ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'sudo -n tar -C / -xf - --no-same-owner --no-overwrite-dir' ||
         die "failed to copy system files"
     remote_root "chown root:root /etc /usr /etc/systemd /etc/systemd/system /etc/systemd/system.conf.d /etc/systemd/journald.conf.d /etc/sysctl.d /etc/bluetooth /usr/local /usr/local/bin"
     remote_root "chmod 0755 /etc /usr /etc/systemd /etc/systemd/system /usr/local /usr/local/bin"
-    remote_root "chown -R root:root /etc/pipewire /etc/wireplumber /etc/bluetooth/main.conf /etc/machine-info /etc/shairport-sync.conf /etc/pizero /etc/sysctl.d /etc/systemd/journald.conf.d /etc/systemd/system.conf.d /etc/systemd/system/bluetooth.service.d /etc/systemd/system/avahi-daemon.service.d /etc/systemd/system/pizero-bt-agent.service /etc/systemd/system/pizero-net-watchdog.service /etc/systemd/system/pizero-net-watchdog.timer /usr/local/bin/pizero-bluetooth-radio /usr/local/bin/pizero-bluetooth-mode /usr/local/bin/pizero-bt-agent /usr/local/bin/pizero-bt-pair /usr/local/bin/pizero-bt-pair-close /usr/local/bin/pizero-audio-reconnect /usr/local/bin/pizero-net-watchdog /etc/NetworkManager/dispatcher.d/90-pizero-audio-reconnect"
-    remote_root "chmod 0755 /usr/local/bin/pizero-bluetooth-radio /usr/local/bin/pizero-bluetooth-mode /usr/local/bin/pizero-bt-agent /usr/local/bin/pizero-bt-pair /usr/local/bin/pizero-bt-pair-close /usr/local/bin/pizero-audio-reconnect /usr/local/bin/pizero-net-watchdog /etc/NetworkManager/dispatcher.d/90-pizero-audio-reconnect"
+    remote_root "chown -R root:root /etc/pipewire /etc/wireplumber /etc/bluetooth/main.conf /etc/machine-info /etc/shairport-sync.conf /etc/pizero /etc/sysctl.d /etc/systemd/journald.conf.d /etc/systemd/system.conf.d /etc/systemd/system/bluetooth.service.d /etc/systemd/system/avahi-daemon.service.d /etc/systemd/system/pizero-bt-agent.service /etc/systemd/system/pizero-mode.service /etc/systemd/system/pizero-net-watchdog.service /etc/systemd/system/pizero-net-watchdog.timer /usr/local/bin/pizero-bluetooth-radio /usr/local/bin/pizero-bluetooth-mode /usr/local/bin/pizero-bt-agent /usr/local/bin/pizero-bt-pair /usr/local/bin/pizero-bt-pair-close /usr/local/bin/pizero-mode /usr/local/bin/pizero-audio-reconnect /usr/local/bin/pizero-net-watchdog /etc/NetworkManager/dispatcher.d/90-pizero-audio-reconnect"
+    remote_root "chmod 0755 /usr/local/bin/pizero-bluetooth-radio /usr/local/bin/pizero-bluetooth-mode /usr/local/bin/pizero-bt-agent /usr/local/bin/pizero-bt-pair /usr/local/bin/pizero-bt-pair-close /usr/local/bin/pizero-mode /usr/local/bin/pizero-audio-reconnect /usr/local/bin/pizero-net-watchdog /etc/NetworkManager/dispatcher.d/90-pizero-audio-reconnect"
     remote_root "chmod 0644 /etc/bluetooth/main.conf /etc/machine-info /etc/shairport-sync.conf /etc/pizero/speaker-name"
 
     # User-owned units and application config, into the Pi user's $HOME.
     tar -C "$STAGE/home/USER" -cf - . |
         ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'tar -C "$HOME" -xf - --no-overwrite-dir' ||
         die "failed to copy user files"
-    deploy_bt_mode
+    deploy_state_files
     note "config deployed"
 }
 
-deploy_bt_mode() {
+# /etc/pizero/bluetooth-mode and /etc/pizero/mode describe the running Pi, not
+# the repository: like a config file they are only installed when absent, so
+# setup/update/reinstall never undo a user's choice.
+deploy_state_file() {
+    local name=$1
     [[ -n $STAGE ]] || stage_tree
-    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'cat > /tmp/pizero-bluetooth-mode' \
-        <"$STAGE/etc/pizero/bluetooth-mode"
+    ssh "${SSH_OPTS[@]}" "$SSH_TARGET" 'cat > /tmp/pizero-state' \
+        <"$STAGE/etc/pizero/$name"
     remote_root "install -d -m 0755 -o root -g root /etc/pizero"
-    remote_root "test -f /etc/pizero/bluetooth-mode || install -m 0644 -o root -g root /tmp/pizero-bluetooth-mode /etc/pizero/bluetooth-mode"
-    remote_root "chmod 0644 /etc/pizero/bluetooth-mode"
-    remote_root "rm -f /tmp/pizero-bluetooth-mode"
+    remote_root "test -f /etc/pizero/$name || install -m 0644 -o root -g root /tmp/pizero-state /etc/pizero/$name"
+    remote_root "chmod 0644 /etc/pizero/$name"
+    remote_root "rm -f /tmp/pizero-state"
+}
+
+deploy_state_files() {
+    deploy_state_file bluetooth-mode
+    deploy_state_file mode
 }
 
 # --- package and system configuration ---------------------------------------
@@ -399,7 +440,7 @@ mask_system_daemons() {
 enable_units() {
     say "Enabling services"
     remote "systemctl --user enable pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service >/dev/null 2>&1 || true"
-    remote_root "systemctl enable avahi-daemon.service pizero-bluetooth-radio.service pizero-bt-agent.service pizero-net-watchdog.timer >/dev/null"
+    remote_root "systemctl enable avahi-daemon.service pizero-bluetooth-radio.service pizero-bt-agent.service pizero-net-watchdog.timer pizero-mode.service >/dev/null"
     remote "systemctl --user enable ${USER_SERVICES[*]} >/dev/null"
 }
 
@@ -411,40 +452,79 @@ reload_units() {
     remote "systemctl --user daemon-reload"
 }
 
+mode_disables() {
+    # $1 = mode, $2 = unit (with or without .service)
+    case "$1:${2%.service}" in
+        bluetooth:shairport-sync | bluetooth:gmediarender | bluetooth:spotify-connect) return 0 ;;
+        network:bluetooth | network:pizero-bt-agent) return 0 ;;
+    esac
+    return 1
+}
+
+# Apply the persisted mode: enable/disable and start/stop exactly what it
+# allows. Called after enable_units, which enables everything.
+apply_mode() {
+    local mode
+    mode=$(speaker_mode)
+    say "Applying speaker mode '$mode'"
+    remote_root "/usr/local/bin/pizero-mode $mode"
+}
+
 restart_services() {
-    say "Restarting services"
+    local mode
+    mode=$(speaker_mode)
+    say "Restarting services ($mode mode)"
     # Bluetooth first: applies main.conf, re-powers the adapter and the mode.
-    remote_root "systemctl restart bluetooth.service"
-    remote_root "systemctl restart pizero-bluetooth-radio.service pizero-bt-agent.service pizero-net-watchdog.timer || true"
+    if [[ $mode != network ]]; then
+        remote_root "systemctl restart bluetooth.service"
+        remote_root "systemctl restart pizero-bluetooth-radio.service pizero-bt-agent.service pizero-net-watchdog.timer || true"
+    fi
     # Take the clients down first, then rebuild the graph in dependency order:
     # WirePlumber must not start while PipeWire is still tearing objects down.
-    remote "systemctl --user stop ${APP_SERVICES[*]}" || true
+    if [[ $mode != bluetooth ]]; then
+        remote "systemctl --user stop ${APP_SERVICES[*]}" || true
+    fi
     remote "systemctl --user stop wireplumber.service" || true
     remote "systemctl --user restart pipewire.socket pipewire.service" || true
     remote "systemctl --user restart pipewire-pulse.socket pipewire-pulse.service" || true
     sleep 2
     remote "systemctl --user restart wireplumber.service" || true
     sleep 3
-    remote "systemctl --user restart ${APP_SERVICES[*]}" || true
+    if [[ $mode != bluetooth ]]; then
+        remote "systemctl --user restart ${APP_SERVICES[*]}" || true
+    fi
     note "services restarted"
 }
 
 verify_active() {
     say "Verifying services"
-    local failed=0 name state
+    local failed=0 name state enabled mode
+    mode=$(speaker_mode)
     for name in "${USER_SERVICES[@]}"; do
         state=$(remote "systemctl --user is-active $name.service 2>/dev/null || true" | tr -d '\r')
+        if mode_disables "$mode" "$name"; then
+            enabled=$(remote "systemctl --user is-enabled $name.service 2>/dev/null || true" | tr -d '\r')
+            [[ $state != active && $enabled == disabled ]] ||
+                { note "user/$name: must be off in $mode mode (active=$state, enabled=$enabled)"; failed=1; }
+            continue
+        fi
         [[ $state == active ]] || { note "user/$name: $state"; failed=1; }
     done
     for name in "${SYSTEM_SERVICES[@]}"; do
         state=$(remote_root "systemctl is-active $name.service 2>/dev/null || true" | tr -d '\r')
+        if mode_disables "$mode" "$name"; then
+            enabled=$(remote_root "systemctl is-enabled $name.service 2>/dev/null || true" | tr -d '\r')
+            [[ $state != active && $enabled == disabled ]] ||
+                { note "system/$name: must be off in $mode mode (active=$state, enabled=$enabled)"; failed=1; }
+            continue
+        fi
         [[ $state == active ]] || { note "system/$name: $state"; failed=1; }
     done
     for name in "${SYSTEM_TIMERS[@]}"; do
         state=$(remote_root "systemctl is-active $name 2>/dev/null || true" | tr -d '\r')
         [[ $state == active ]] || { note "timer/$name: $state"; failed=1; }
     done
-    ((failed == 0)) || die "some services are not active (see: $(basename "$0") status)"
+    ((failed == 0)) || die "some services are in the wrong state (see: $(basename "$0") status)"
 }
 
 # --- commands ---------------------------------------------------------------
@@ -464,6 +544,7 @@ cmd_setup() {
     mask_system_daemons
     reload_units
     enable_units
+    apply_mode
     restart_services
     verify_active
     say "Setup complete - the Pi advertises as '$SPEAKER_NAME'"
@@ -481,6 +562,7 @@ cmd_update() {
     mask_system_daemons
     reload_units
     enable_units
+    apply_mode
     restart_services
     verify_active
     say "Update complete"
@@ -499,6 +581,7 @@ cmd_reinstall() {
     mask_system_daemons
     reload_units
     enable_units
+    apply_mode
     restart_services
     verify_active
     say "Reinstall complete"
@@ -514,6 +597,15 @@ cmd_status() {
     init_ssh
     remote 'bash -s' <<'STATUS'
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
+mode=$(cat /etc/pizero/mode 2>/dev/null || echo all)
+case "$mode" in all | bluetooth | network) ;; *) mode=all ;; esac
+off_by_mode() {
+    case "$mode:$1" in
+        bluetooth:shairport-sync.service | bluetooth:gmediarender.service | bluetooth:spotify-connect.service) return 0 ;;
+        network:bluetooth.service | network:pizero-bt-agent.service) return 0 ;;
+    esac
+    return 1
+}
 svc() {
     local unit=$1 scope=${2:-} state name
     name=$unit
@@ -523,11 +615,15 @@ svc() {
     else
         state=$(systemctl is-active "$name" 2>/dev/null || true)
     fi
+    if [[ $state != active ]] && off_by_mode "$name"; then
+        state="off (mode)"
+    fi
     printf '  %-18s %s\n' "$unit" "${state:-unknown}"
 }
 pretty=$(sed -n 's/^PRETTY_HOSTNAME="\(.*\)"/\1/p' /etc/machine-info 2>/dev/null)
 printf 'Speaker "%s" on %s\n' "${pretty:-unknown}" "$(hostname)"
 printf '  %-18s %s\n' "overlay root" "$(grep -q 'overlayroot=tmpfs' /boot/firmware/cmdline.txt 2>/dev/null && echo on || echo off)"
+printf '  %-18s %s\n' "mode" "$mode"
 printf 'Services (user):\n'
 for s in pipewire wireplumber pipewire-pulse shairport-sync gmediarender spotify-connect; do
     svc "$s" --user
@@ -538,16 +634,21 @@ for s in bluetooth pizero-bt-agent avahi-daemon; do
 done
 svc "pizero-net-watchdog.timer" ""
 printf 'Bluetooth:\n'
-bt=$(bluetoothctl show 2>/dev/null || true)
-for k in Name Alias Powered Discoverable Pairable; do
-    v=$(sed -n "s/^[[:space:]]*$k: //p" <<<"$bt" | head -1)
-    printf '  %-14s %s\n' "$k" "${v:-?}"
-done
-printf '  %-14s %s\n' "mode" "$(cat /etc/pizero/bluetooth-mode 2>/dev/null || echo locked)"
-printf '  %-14s %s\n' "paired" "$(bluetoothctl devices Paired 2>/dev/null | wc -l) device(s)"
-bluetoothctl devices Paired 2>/dev/null | while read -r _ mac name; do
-    printf '    %s %s\n' "$mac" "$name"
-done
+if [ "$(systemctl is-active bluetooth.service 2>/dev/null)" = active ]; then
+    bt=$(timeout 15 bluetoothctl show 2>/dev/null || true)
+    for k in Name Alias Powered Discoverable Pairable; do
+        v=$(sed -n "s/^[[:space:]]*$k: //p" <<<"$bt" | head -1)
+        printf '  %-14s %s\n' "$k" "${v:-?}"
+    done
+    printf '  %-14s %s\n' "paired" "$(timeout 15 bluetoothctl devices Paired 2>/dev/null | wc -l) device(s)"
+    timeout 15 bluetoothctl devices Paired 2>/dev/null | while read -r _ mac name; do
+        printf '    %s %s\n' "$mac" "$name"
+    done
+else
+    # bluetoothctl waits forever for a daemon that the mode keeps stopped.
+    printf '  %-14s %s\n' "Powered" "off (mode)"
+fi
+printf '  %-14s %s\n' "lock mode" "$(cat /etc/pizero/bluetooth-mode 2>/dev/null || echo locked)"
 printf 'Audio:\n'
 printf '  %-14s %s\n' "default sink" "$(pactl get-default-sink 2>/dev/null || echo '?')"
 printf '  %-14s %s\n' "USB DAC" "$(pactl list short sinks 2>/dev/null | grep -qiE 'usb-' && echo present || echo absent)"
@@ -578,6 +679,7 @@ cmd_logs() {
 
 cmd_bt_pair() {
     init_ssh
+    require_bluetooth_mode
     require_writable
     remote_root "pizero-bt-pair ${1:-120}"
 }
@@ -590,6 +692,7 @@ cmd_bt_mode() {
         open | locked) ;;
         *) die "usage: $(basename "$0") bt-mode open|locked" ;;
     esac
+    require_bluetooth_mode
     remote_root "install -d -m 0755 -o root -g root /etc/pizero"
     remote_root "printf '%s\n' '$mode' > /etc/pizero/bluetooth-mode && chmod 0644 /etc/pizero/bluetooth-mode"
     remote_root "rm -f /run/pizero/bt-pair-until; systemctl stop pizero-bt-pair-timeout.service pizero-bt-pair-timeout.timer >/dev/null 2>&1 || true"
@@ -598,6 +701,7 @@ cmd_bt_mode() {
 
 cmd_bt_devices() {
     init_ssh
+    require_bluetooth_mode
     remote 'bash -s' <<'DEVS'
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 printf 'mode: %s\n' "$(cat /etc/pizero/bluetooth-mode 2>/dev/null || echo locked)"
@@ -619,8 +723,26 @@ cmd_bt_forget() {
     local mac=${1:-}
     [[ $mac =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] ||
         die "usage: $(basename "$0") bt-forget <MAC>"
+    require_bluetooth_mode
     remote_root "bluetoothctl --timeout 10 remove $mac"
     note "forgot $mac"
+}
+
+cmd_mode() {
+    init_ssh
+    local mode=${1:-}
+    if [[ -z $mode ]]; then
+        note "speaker mode: $(speaker_mode)"
+        return 0
+    fi
+    case $mode in
+        all | bluetooth | network) ;;
+        *) die "usage: $(basename "$0") mode [all|bluetooth|network]" ;;
+    esac
+    require_writable
+    say "Setting speaker mode '$mode'"
+    remote_root "/usr/local/bin/pizero-mode $mode"
+    note "speaker mode: $(speaker_mode)"
 }
 
 cmd_protect() {
@@ -668,6 +790,7 @@ main() {
         reinstall) cmd_reinstall ;;
         status) cmd_status ;;
         restart) cmd_restart ;;
+        mode) shift; cmd_mode "${1:-}" ;;
         logs) shift; cmd_logs "${1:-}" ;;
         bt-pair) shift; cmd_bt_pair "${1:-}" ;;
         bt-mode) shift; cmd_bt_mode "${1:-}" ;;

@@ -8,6 +8,12 @@ for dir in /run/user/*/pulse; do
     uid=${dir#/run/user/}
     uid=${uid%/pulse}
     user=$(id -un "$uid" 2>/dev/null) || continue
+    # Only restart a receiver that the speaker mode leaves enabled; a stopped
+    # or disabled unit must never be started by a network event. try-restart
+    # does not start an inactive unit, and the enable check keeps it inert in
+    # bluetooth mode (where spotify-connect is disabled).
+    /usr/sbin/runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
+        systemctl --user is-enabled --quiet spotify-connect.service 2>/dev/null || continue
     /usr/sbin/runuser -u "$user" -- env XDG_RUNTIME_DIR="/run/user/$uid" \
         systemctl --user try-restart spotify-connect.service >/dev/null 2>&1 || true
     /usr/bin/logger -t pizero-audio-reconnect "restarted spotify-connect for $user (uid $uid)"
